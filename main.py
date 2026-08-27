@@ -97,6 +97,8 @@ def package_digest_of(inventory: List[Dict[str, Any]]) -> str:
 
 
 def candidate_files_valid(cand: Dict[str, Any]) -> bool:
+    if not is_plain_object(cand):
+        return False
     files = cand.get("files")
     if not is_plain_object(files) or len(files) == 0:
         return False
@@ -120,8 +122,8 @@ def candidate_structure_valid(cand: Any) -> bool:
     return True
 
 
-def process_freeze_candidate(cand: Dict[str, Any], req: Dict[str, Any], allowed_reasons: List[str]) -> Dict[str, Any]:
-    name = cand.get("name")
+def process_freeze_candidate(cand: Any, req: Dict[str, Any], allowed_reasons: List[str]) -> Dict[str, Any]:
+    name = cand.get("name") if is_plain_object(cand) else None
     files_ok = candidate_files_valid(cand)
     struct_ok = candidate_structure_valid(cand)
 
@@ -138,7 +140,7 @@ def process_freeze_candidate(cand: Dict[str, Any], req: Dict[str, Any], allowed_
     if not struct_ok or not files_ok:
         status = "invalid"
         reason_codes.append("INVALID_INPUT")
-    elif is_nonempty_str(cand.get("unsupportedReason")):
+    elif is_nonempty_str(is_plain_object(cand) and cand.get("unsupportedReason")):
         if cand["unsupportedReason"] in allowed_reasons:
             status = "unsupported"
         else:
@@ -170,34 +172,15 @@ def process_freeze_candidate(cand: Dict[str, Any], req: Dict[str, Any], allowed_
 
 
 def validate_freeze_shape(body: Dict[str, Any]) -> bool:
-    if not is_nonempty_str(body.get("freezeId")) or len(body["freezeId"]) > 128:
-        return False
-    if not is_nonempty_str(body.get("calibrationDigest")):
-        return False
-    if not is_nonempty_str(body.get("tokenizerDigest")):
-        return False
+    # Per spec, the ONLY freeze-phase condition that triggers a top-level
+    # 400 INVALID_INPUT is an empty or non-array `candidates` list.
+    # Everything else (bad freezeId, missing digests, malformed candidate
+    # fields, duplicate names, disallowed unsupportedReason, etc.) must be
+    # reported per-candidate inside the 200 response instead of rejecting
+    # the whole batch.
     candidates = body.get("candidates")
     if not isinstance(candidates, list) or len(candidates) == 0:
         return False
-
-    allowed_reasons = body.get("allowedUnsupportedReasons", [])
-    if allowed_reasons is None:
-        allowed_reasons = []
-    if not isinstance(allowed_reasons, list):
-        return False
-    for r in allowed_reasons:
-        if not is_nonempty_str(r):
-            return False
-    if len(set(allowed_reasons)) != len(allowed_reasons):
-        return False
-
-    for c in candidates:
-        if not is_plain_object(c) or not is_nonempty_str(c.get("name")):
-            return False
-    names = [c["name"] for c in candidates]
-    if len(set(names)) != len(names):
-        return False
-
     return True
 
 
@@ -205,16 +188,18 @@ def handle_freeze(body: Dict[str, Any]) -> JSONResponse:
     if not validate_freeze_shape(body):
         return error_response(400, "INVALID_INPUT")
 
-    allowed_reasons = body.get("allowedUnsupportedReasons") or []
+    allowed_reasons = body.get("allowedUnsupportedReasons")
+    if not isinstance(allowed_reasons, list):
+        allowed_reasons = []
 
     relevant_input = {
-        "calibrationDigest": body["calibrationDigest"],
-        "tokenizerDigest": body["tokenizerDigest"],
+        "calibrationDigest": body.get("calibrationDigest"),
+        "tokenizerDigest": body.get("tokenizerDigest"),
         "allowedUnsupportedReasons": allowed_reasons,
         "candidates": body["candidates"],
     }
 
-    existing = FREEZE_STORE.get(body["freezeId"])
+    existing = FREEZE_STORE.get(body.get("freezeId"))
     if existing:
         if deep_equal(existing["rawInput"], relevant_input):
             return JSONResponse(status_code=200, content=existing["response"])
@@ -223,11 +208,11 @@ def handle_freeze(body: Dict[str, Any]) -> JSONResponse:
     candidates = [
         process_freeze_candidate(c, body, allowed_reasons) for c in body["candidates"]
     ]
-    candidates.sort(key=lambda c: utf8_key(c["name"]))
+    candidates.sort(key=lambda c: utf8_key(c.get("name") or ""))
 
-    response = {"freezeId": body["freezeId"], "candidates": candidates}
+    response = {"freezeId": body.get("freezeId"), "candidates": candidates}
 
-    FREEZE_STORE[body["freezeId"]] = {"rawInput": relevant_input, "response": response}
+    FREEZE_STORE[body.get("freezeId")] = {"rawInput": relevant_input, "response": response}
 
     return JSONResponse(status_code=200, content=response)
 
@@ -241,9 +226,11 @@ def round12(x: float) -> float:
 
 
 def valid_select_shape(body: Dict[str, Any]) -> bool:
+    # Per spec, the ONLY select-phase condition that triggers a top-level
+    # 400 INVALID_INPUT is: candidates not an array, rows not an array, or
+    # policy not an object. freezeId format issues are handled downstream.
     return (
-        is_nonempty_str(body.get("freezeId"))
-        and isinstance(body.get("candidates"), list)
+        isinstance(body.get("candidates"), list)
         and isinstance(body.get("rows"), list)
         and is_plain_object(body.get("policy"))
     )
