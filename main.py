@@ -2,50 +2,17 @@ import hashlib
 import json
 import math
 import threading
-from typing import Any, Dict, List, Optional, Union
 
-from fastapi import FastAPI
+from typing import Any
+
+from fastapi import FastAPI, Request, Body
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
 
 app = FastAPI(title="Quantize Candidate Admission API")
 
-
-# ============================================================
-# Pydantic request model
-# ============================================================
-
-class QuantizeRequest(BaseModel):
-    model_config = ConfigDict(extra="allow")
-
-    phase: Optional[str] = None
-    freezeId: Optional[str] = None
-
-    calibrationDigest: Optional[str] = None
-    tokenizerDigest: Optional[str] = None
-
-    allowedUnsupportedReasons: Optional[List[str]] = None
-
-    candidates: Optional[List[Dict[str, Any]]] = None
-
-    policy: Optional[Dict[str, Any]] = None
-
-    latencies: Optional[Dict[str, Any]] = None
-
-    rows: Optional[List[Dict[str, Any]]] = None
-
-
-# ============================================================
-# State
-# ============================================================
-
-FREEZES: Dict[str, Dict[str, Any]] = {}
+FREEZES = {}
 LOCK = threading.Lock()
 
-
-# ============================================================
-# Helpers
-# ============================================================
 
 def compact_json(value):
     return json.dumps(
@@ -55,104 +22,107 @@ def compact_json(value):
     ).encode("utf-8")
 
 
-def sha256_bytes(data: bytes) -> str:
+def sha256(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def utf8_sort_key(value: str):
+def utf8(value):
     return value.encode("utf-8")
 
 
 def sort_codes(codes):
-    return sorted(set(codes), key=utf8_sort_key)
+    return sorted(set(codes), key=utf8)
 
 
-def is_nonempty_string(value):
-    return isinstance(value, str) and len(value) > 0
+def nonempty_string(x):
+    return isinstance(x, str) and len(x) > 0
 
 
-def is_safe_integer(value):
+def finite_number(x):
     return (
-        isinstance(value, int)
-        and not isinstance(value, bool)
-        and 0 <= value <= 9007199254740991
+        isinstance(x, (int, float))
+        and not isinstance(x, bool)
+        and math.isfinite(float(x))
     )
 
 
-def is_finite_number(value):
+def safe_integer(x):
     return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(float(value))
+        isinstance(x, int)
+        and not isinstance(x, bool)
+        and 0 <= x <= 9007199254740991
     )
 
 
-def round12(value):
-    return float(f"{value:.12f}")
+def binary(x):
+    return (
+        isinstance(x, int)
+        and not isinstance(x, bool)
+        and x in (0, 1)
+    )
 
 
-def deep_copy(value):
-    return json.loads(json.dumps(value, ensure_ascii=False))
+def round12(x):
+    return float(f"{x:.12f}")
 
 
-# ============================================================
-# File integrity
-# ============================================================
+def equal_json(a, b):
+    return compact_json(a) == compact_json(b)
+
 
 def build_inventory(files):
-    if not isinstance(files, dict):
-        return False, [], None, None
 
-    if len(files) == 0:
+    if not isinstance(files, dict) or not files:
         return False, [], None, None
 
     inventory = []
 
-    for filename, text in files.items():
+    for filename, content in files.items():
 
-        if not isinstance(filename, str) or filename == "":
+        if not isinstance(filename, str):
             return False, [], None, None
 
-        if not isinstance(text, str):
+        if filename == "":
+            return False, [], None, None
+
+        if not isinstance(content, str):
             return False, [], None, None
 
         try:
-            data = text.encode("utf-8")
+            data = content.encode("utf-8")
         except UnicodeEncodeError:
             return False, [], None, None
 
         inventory.append({
             "name": filename,
             "bytes": len(data),
-            "sha256": sha256_bytes(data)
+            "sha256": sha256(data)
         })
 
     inventory.sort(
-        key=lambda item: utf8_sort_key(item["name"])
+        key=lambda x: utf8(x["name"])
     )
 
-    total_bytes = sum(
-        item["bytes"]
-        for item in inventory
+    total = sum(
+        x["bytes"]
+        for x in inventory
     )
 
-    package_digest = sha256_bytes(
+    package_digest = sha256(
         compact_json(inventory)
     )
 
-    return (
-        True,
-        inventory,
-        total_bytes,
-        package_digest
-    )
+    return True, inventory, total, package_digest
 
 
-# ============================================================
-# Freeze validation
-# ============================================================
+# =========================================================
+# FREEZE VALIDATION
+# =========================================================
 
-def validate_freeze(body):
+def valid_freeze(body):
+
+    if not isinstance(body, dict):
+        return False
 
     if body.get("phase") != "freeze":
         return False
@@ -161,17 +131,16 @@ def validate_freeze(body):
 
     if (
         not isinstance(freeze_id, str)
-        or len(freeze_id) == 0
-        or len(freeze_id) > 128
+        or not 1 <= len(freeze_id) <= 128
     ):
         return False
 
-    if not is_nonempty_string(
+    if not nonempty_string(
         body.get("calibrationDigest")
     ):
         return False
 
-    if not is_nonempty_string(
+    if not nonempty_string(
         body.get("tokenizerDigest")
     ):
         return False
@@ -183,8 +152,8 @@ def validate_freeze(body):
     if not isinstance(allowed, list):
         return False
 
-    if not all(
-        is_nonempty_string(x)
+    if any(
+        not nonempty_string(x)
         for x in allowed
     ):
         return False
@@ -192,24 +161,26 @@ def validate_freeze(body):
     if len(allowed) != len(set(allowed)):
         return False
 
-    candidates = body.get("candidates")
+    candidates = body.get(
+        "candidates"
+    )
 
-    if not isinstance(candidates, list):
-        return False
-
-    if len(candidates) == 0:
+    if (
+        not isinstance(candidates, list)
+        or len(candidates) == 0
+    ):
         return False
 
     names = set()
 
-    for candidate in candidates:
+    for c in candidates:
 
-        if not isinstance(candidate, dict):
+        if not isinstance(c, dict):
             return False
 
-        name = candidate.get("name")
+        name = c.get("name")
 
-        if not is_nonempty_string(name):
+        if not nonempty_string(name):
             return False
 
         if name in names:
@@ -217,55 +188,54 @@ def validate_freeze(body):
 
         names.add(name)
 
-        if not isinstance(
-            candidate.get("files"),
-            dict
+        files = c.get("files")
+
+        if (
+            not isinstance(files, dict)
+            or len(files) == 0
         ):
             return False
 
-        if len(candidate["files"]) == 0:
-            return False
-
         if not isinstance(
-            candidate.get("loadable"),
+            c.get("loadable"),
             bool
         ):
             return False
 
-        if not is_nonempty_string(
-            candidate.get("calibrationDigest")
+        if not nonempty_string(
+            c.get("calibrationDigest")
         ):
             return False
 
-        if not is_nonempty_string(
-            candidate.get("tokenizerDigest")
+        if not nonempty_string(
+            c.get("tokenizerDigest")
         ):
             return False
 
-        if "unsupportedReason" in candidate:
+        if "unsupportedReason" in c:
 
-            reason = candidate["unsupportedReason"]
+            reason = c["unsupportedReason"]
 
             if (
                 reason is not None
-                and not is_nonempty_string(reason)
+                and not nonempty_string(reason)
             ):
                 return False
 
     return True
 
 
-# ============================================================
-# Freeze
-# ============================================================
+# =========================================================
+# FREEZE
+# =========================================================
 
-def perform_freeze(body):
+def do_freeze(body):
 
-    request_calibration = body[
+    calibration = body[
         "calibrationDigest"
     ]
 
-    request_tokenizer = body[
+    tokenizer = body[
         "tokenizerDigest"
     ]
 
@@ -273,22 +243,21 @@ def perform_freeze(body):
         body["allowedUnsupportedReasons"]
     )
 
-    results = []
+    output = []
 
     for candidate in body["candidates"]:
 
         name = candidate["name"]
 
-        valid_files, inventory, total_bytes, package_digest = (
+        valid, inventory, total, digest = (
             build_inventory(
                 candidate["files"]
             )
         )
 
-        # Invalid file data
-        if not valid_files:
+        if not valid:
 
-            results.append({
+            output.append({
                 "name": name,
                 "status": "invalid",
                 "inventory": [],
@@ -303,44 +272,38 @@ def perform_freeze(body):
 
         reason_codes = []
 
-        unsupported_reason = candidate.get(
+        unsupported = candidate.get(
             "unsupportedReason"
         )
 
-        # Unsupported candidate
-        if unsupported_reason is not None:
+        if unsupported is not None:
 
-            if unsupported_reason not in allowed:
+            if unsupported not in allowed:
 
-                reason_codes.append(
-                    "UNALLOWED_UNSUPPORTED_REASON"
-                )
-
-                results.append({
+                output.append({
                     "name": name,
                     "status": "invalid",
                     "inventory": inventory,
-                    "totalBytes": total_bytes,
-                    "packageDigest": package_digest,
-                    "reasonCodes": sort_codes(
-                        reason_codes
-                    )
+                    "totalBytes": total,
+                    "packageDigest": digest,
+                    "reasonCodes": [
+                        "UNALLOWED_UNSUPPORTED_REASON"
+                    ]
                 })
 
             else:
 
-                results.append({
+                output.append({
                     "name": name,
                     "status": "unsupported",
                     "inventory": inventory,
-                    "totalBytes": total_bytes,
-                    "packageDigest": package_digest,
+                    "totalBytes": total,
+                    "packageDigest": digest,
                     "reasonCodes": []
                 })
 
             continue
 
-        # Normal candidate
         if not candidate["loadable"]:
             reason_codes.append(
                 "NOT_LOADABLE"
@@ -348,7 +311,7 @@ def perform_freeze(body):
 
         if (
             candidate["calibrationDigest"]
-            != request_calibration
+            != calibration
         ):
             reason_codes.append(
                 "CALIBRATION_MISMATCH"
@@ -356,52 +319,47 @@ def perform_freeze(body):
 
         if (
             candidate["tokenizerDigest"]
-            != request_tokenizer
+            != tokenizer
         ):
             reason_codes.append(
                 "TOKENIZER_MISMATCH"
             )
 
-        status = (
-            "frozen"
-            if len(reason_codes) == 0
-            else "invalid"
-        )
-
-        results.append({
+        output.append({
             "name": name,
-            "status": status,
+            "status": (
+                "frozen"
+                if not reason_codes
+                else "invalid"
+            ),
             "inventory": inventory,
-            "totalBytes": total_bytes,
-            "packageDigest": package_digest,
+            "totalBytes": total,
+            "packageDigest": digest,
             "reasonCodes": sort_codes(
                 reason_codes
             )
         })
 
-    # UTF-8 name ordering
-    results.sort(
-        key=lambda item: utf8_sort_key(
-            item["name"]
-        )
+    output.sort(
+        key=lambda x: utf8(x["name"])
     )
 
     return {
         "freezeId": body["freezeId"],
-        "candidates": results
+        "candidates": output
     }
 
 
-# ============================================================
-# Policy validation
-# ============================================================
+# =========================================================
+# SELECT VALIDATION
+# =========================================================
 
-def validate_policy(policy):
+def valid_policy(policy):
 
     if not isinstance(policy, dict):
         return False
 
-    if not is_safe_integer(
+    if not safe_integer(
         policy.get("maxBytes")
     ):
         return False
@@ -410,38 +368,38 @@ def validate_policy(policy):
         "aggregateFloor"
     )
 
-    if not is_finite_number(floor):
+    if (
+        not finite_number(floor)
+        or not 0 <= float(floor) <= 1
+    ):
         return False
 
-    if not 0 <= float(floor) <= 1:
-        return False
-
-    required = policy.get(
+    slices = policy.get(
         "requiredSlices"
     )
 
-    if not isinstance(required, dict):
+    if not isinstance(slices, dict):
         return False
 
-    for name, value in required.items():
+    for name, value in slices.items():
 
-        if not is_nonempty_string(name):
+        if not nonempty_string(name):
             return False
 
-        if not is_finite_number(value):
+        if (
+            not finite_number(value)
+            or not 0 <= float(value) <= 1
+        ):
             return False
 
-        if not 0 <= float(value) <= 1:
-            return False
-
-    latency = policy.get(
+    max_latency = policy.get(
         "maxLatencyMs"
     )
 
-    if not is_finite_number(latency):
-        return False
-
-    if float(latency) < 0:
+    if (
+        not finite_number(max_latency)
+        or float(max_latency) < 0
+    ):
         return False
 
     order = policy.get(
@@ -451,8 +409,8 @@ def validate_policy(policy):
     if not isinstance(order, list):
         return False
 
-    if not all(
-        is_nonempty_string(x)
+    if any(
+        not nonempty_string(x)
         for x in order
     ):
         return False
@@ -463,34 +421,22 @@ def validate_policy(policy):
     return True
 
 
-# ============================================================
-# Prediction validation
-# ============================================================
+# =========================================================
+# METRICS
+# =========================================================
 
-def is_binary(value):
-    return (
-        isinstance(value, int)
-        and not isinstance(value, bool)
-        and value in (0, 1)
-    )
+def metrics(name, rows, required):
 
-
-def calculate_accuracy(
-    candidate_name,
-    rows,
-    required_slices
-):
-
-    if not isinstance(rows, list):
-        return False, None, {}
-
-    if len(rows) == 0:
+    if (
+        not isinstance(rows, list)
+        or len(rows) == 0
+    ):
         return False, None, {}
 
     correct = 0
 
-    slice_total = {}
-    slice_correct = {}
+    totals = {}
+    correct_slices = {}
 
     for row in rows:
 
@@ -499,14 +445,14 @@ def calculate_accuracy(
 
         label = row.get("label")
 
-        if not is_binary(label):
+        if not binary(label):
             return False, None, {}
 
         slice_name = row.get(
             "slice"
         )
 
-        if not is_nonempty_string(
+        if not nonempty_string(
             slice_name
         ):
             return False, None, {}
@@ -521,26 +467,27 @@ def calculate_accuracy(
         ):
             return False, None, {}
 
-        if candidate_name not in predictions:
+        if name not in predictions:
             return False, None, {}
 
-        prediction = predictions[
-            candidate_name
-        ]
+        prediction = predictions[name]
 
-        if not is_binary(prediction):
+        if not binary(prediction):
             return False, None, {}
 
-        if prediction == label:
-            correct += 1
-
-        slice_total[slice_name] = (
-            slice_total.get(slice_name, 0) + 1
+        totals[slice_name] = (
+            totals.get(slice_name, 0) + 1
         )
 
         if prediction == label:
-            slice_correct[slice_name] = (
-                slice_correct.get(slice_name, 0) + 1
+
+            correct += 1
+
+            correct_slices[slice_name] = (
+                correct_slices.get(
+                    slice_name,
+                    0
+                ) + 1
             )
 
     aggregate = round12(
@@ -549,68 +496,49 @@ def calculate_accuracy(
 
     slices = {}
 
-    for slice_name in required_slices:
+    for slice_name in required:
 
-        if slice_name in slice_total:
+        if slice_name in totals:
 
             slices[slice_name] = round12(
-                slice_correct.get(
+                correct_slices.get(
                     slice_name,
                     0
-                )
-                / slice_total[slice_name]
+                ) / totals[slice_name]
             )
 
     return True, aggregate, slices
 
 
-# ============================================================
-# Select
-# ============================================================
+# =========================================================
+# SELECT
+# =========================================================
 
-def perform_select(
-    body,
-    frozen_response
-):
+def do_select(body, stored):
 
-    stored_candidates = (
-        frozen_response["candidates"]
-    )
+    frozen = stored["candidates"]
 
-    supplied_candidates = (
-        body["candidates"]
-    )
+    supplied = body["candidates"]
 
-    supplied_by_name = {}
-
-    for candidate in supplied_candidates:
-
-        if isinstance(candidate, dict):
-            name = candidate.get("name")
-
-            if isinstance(name, str):
-                supplied_by_name[name] = candidate
-
-    stored_by_name = {
-        candidate["name"]: candidate
-        for candidate in stored_candidates
+    frozen_names = {
+        x["name"]
+        for x in frozen
     }
 
-    supplied_names = set(
-        supplied_by_name.keys()
-    )
-
-    stored_names = set(
-        stored_by_name.keys()
-    )
+    supplied_names = {
+        x["name"]
+        for x in supplied
+        if isinstance(x, dict)
+        and isinstance(x.get("name"), str)
+    }
 
     policy = body["policy"]
 
-    policy_valid = validate_policy(
+    policy_ok = valid_policy(
         policy
     )
 
-    required_slices = (
+    required = (
         policy.get(
             "requiredSlices",
             {}
@@ -619,7 +547,7 @@ def perform_select(
         else {}
     )
 
-    candidate_order = (
+    order = (
         policy.get(
             "candidateOrder",
             []
@@ -628,42 +556,49 @@ def perform_select(
         else []
     )
 
-    reasons_global = []
+    global_codes = []
 
-    if supplied_names != stored_names:
-        reasons_global.append(
+    if supplied_names != frozen_names:
+        global_codes.append(
             "INVALID_LINEAGE"
         )
 
-    if not policy_valid:
-        reasons_global.append(
+    if not policy_ok:
+        global_codes.append(
             "INVALID_POLICY"
         )
 
-    if supplied_names != set(
-        candidate_order
-    ):
-        reasons_global.append(
+    if supplied_names != set(order):
+        global_codes.append(
             "INVALID_POLICY"
         )
 
-    order_index = {
-        name: index
-        for index, name
-        in enumerate(candidate_order)
+    frozen_by_name = {
+        x["name"]: x
+        for x in frozen
     }
 
-    names = list(
-        supplied_names
-    )
+    supplied_by_name = {
+        x["name"]: x
+        for x in supplied
+        if isinstance(x, dict)
+        and isinstance(x.get("name"), str)
+    }
+
+    order_index = {
+        name: i
+        for i, name in enumerate(order)
+    }
+
+    names = list(supplied_names)
 
     names.sort(
-        key=lambda name: (
+        key=lambda n: (
             order_index.get(
-                name,
-                len(candidate_order)
+                n,
+                len(order)
             ),
-            utf8_sort_key(name)
+            utf8(n)
         )
     )
 
@@ -671,81 +606,92 @@ def perform_select(
 
     for name in names:
 
-        candidate_reasons = list(
-            reasons_global
+        codes = list(global_codes)
+
+        frozen_candidate = (
+            frozen_by_name.get(name)
         )
 
-        stored = stored_by_name.get(
-            name
-        )
-
-        supplied = supplied_by_name.get(
-            name
+        submitted_candidate = (
+            supplied_by_name.get(name)
         )
 
         aggregate = None
         slices = {}
 
         total_bytes = None
-        latency_ms = None
+        latency = None
 
-        # Must have been frozen
         if (
-            stored is None
-            or stored.get("status") != "frozen"
+            frozen_candidate is None
+            or frozen_candidate["status"]
+            != "frozen"
         ):
-            candidate_reasons.append(
+            codes.append(
                 "NOT_FROZEN"
             )
 
-        # Validate manifest
-        if supplied is None:
+        # ---------------------------------------------
+        # Manifest
+        # ---------------------------------------------
 
-            candidate_reasons.append(
-                "INVALID_LINEAGE"
+        if submitted_candidate is None:
+
+            codes.append(
+                "INVALID_MANIFEST"
             )
 
         else:
 
-            valid, inventory, total, digest = (
+            ok, inventory, total, digest = (
                 build_inventory(
-                    supplied.get("files")
+                    submitted_candidate.get(
+                        "files"
+                    )
                 )
             )
 
-            if not valid:
+            if not ok:
 
-                candidate_reasons.append(
+                codes.append(
                     "INVALID_MANIFEST"
                 )
 
             else:
 
-                if inventory != stored.get(
-                    "inventory"
+                if inventory != (
+                    frozen_candidate.get(
+                        "inventory"
+                    )
                 ):
-                    candidate_reasons.append(
+                    codes.append(
                         "INVALID_MANIFEST"
                     )
 
-                if total != stored.get(
-                    "totalBytes"
+                if total != (
+                    frozen_candidate.get(
+                        "totalBytes"
+                    )
                 ):
-                    candidate_reasons.append(
+                    codes.append(
                         "INVALID_MANIFEST"
                     )
 
-                if digest != stored.get(
-                    "packageDigest"
+                if digest != (
+                    frozen_candidate.get(
+                        "packageDigest"
+                    )
                 ):
-                    candidate_reasons.append(
+                    codes.append(
                         "INVALID_MANIFEST"
                     )
 
-                if not candidate_reasons or True:
-                    total_bytes = total
+                total_bytes = total
 
+        # ---------------------------------------------
         # Latency
+        # ---------------------------------------------
+
         latencies = body.get(
             "latencies"
         )
@@ -756,37 +702,36 @@ def perform_select(
                 dict
             )
             or name not in latencies
-            or not is_finite_number(
+            or not finite_number(
                 latencies[name]
             )
             or float(latencies[name]) < 0
         ):
 
-            candidate_reasons.append(
-                "LATENCY_LIMIT"
-            )
+            latency = None
 
         else:
 
-            latency_ms = float(
+            latency = float(
                 latencies[name]
             )
 
+        # ---------------------------------------------
         # Predictions
-        valid_predictions, aggregate, slices = (
-            calculate_accuracy(
-                name,
-                body["rows"],
-                required_slices
-            )
+        # ---------------------------------------------
+
+        valid, aggregate, slices = metrics(
+            name,
+            body["rows"],
+            required
         )
 
-        if not valid_predictions:
+        if not valid:
 
             aggregate = None
             slices = {}
 
-            candidate_reasons.append(
+            codes.append(
                 "INVALID_PREDICTIONS"
             )
 
@@ -795,56 +740,62 @@ def perform_select(
             if aggregate < float(
                 policy["aggregateFloor"]
             ):
-                candidate_reasons.append(
+                codes.append(
                     "AGGREGATE_FLOOR"
                 )
 
             for slice_name, floor in (
-                required_slices.items()
+                required.items()
             ):
 
                 if slice_name not in slices:
 
-                    candidate_reasons.append(
-                        f"MISSING_SLICE:{slice_name}"
+                    codes.append(
+                        "MISSING_SLICE:"
+                        + slice_name
                     )
 
                 elif slices[slice_name] < float(
                     floor
                 ):
 
-                    candidate_reasons.append(
-                        f"SLICE_FLOOR:{slice_name}"
+                    codes.append(
+                        "SLICE_FLOOR:"
+                        + slice_name
                     )
 
+        # ---------------------------------------------
         # Size
+        # ---------------------------------------------
+
         if total_bytes is not None:
 
             if total_bytes > policy[
                 "maxBytes"
             ]:
 
-                candidate_reasons.append(
+                codes.append(
                     "SIZE_LIMIT"
                 )
 
+        # ---------------------------------------------
         # Latency
-        if latency_ms is not None:
+        # ---------------------------------------------
 
-            if latency_ms > float(
+        if latency is not None:
+
+            if latency > float(
                 policy["maxLatencyMs"]
             ):
 
-                candidate_reasons.append(
+                codes.append(
                     "LATENCY_LIMIT"
                 )
 
-        candidate_reasons = sort_codes(
-            candidate_reasons
-        )
+        codes = sort_codes(codes)
 
         admitted = (
-            len(candidate_reasons) == 0
+            len(codes) == 0
         )
 
         results.append({
@@ -852,46 +803,42 @@ def perform_select(
             "aggregate": aggregate,
             "slices": slices,
             "totalBytes": total_bytes,
-            "latencyMs": latency_ms,
+            "latencyMs": latency,
             "admitted": admitted,
-            "reasonCodes": candidate_reasons
+            "reasonCodes": codes
         })
 
     # Winner
-    admitted = [
-        result
-        for result in results
-        if result["admitted"]
+    winners = [
+        x
+        for x in results
+        if x["admitted"]
     ]
 
     winner = None
 
-    if admitted:
+    if winners:
 
         winner = min(
-            admitted,
-            key=lambda result: (
-                result["totalBytes"],
-                result["latencyMs"],
+            winners,
+            key=lambda x: (
+                x["totalBytes"],
+                x["latencyMs"],
                 order_index.get(
-                    result["name"],
-                    len(candidate_order)
+                    x["name"],
+                    len(order)
                 ),
-                utf8_sort_key(
-                    result["name"]
-                )
+                utf8(x["name"])
             )
         )
 
-    package_manifest = None
+    manifest = None
 
-    if winner is not None:
+    if winner:
 
-        package_manifest = deep_copy(
-            stored_by_name[
-                winner["name"]
-            ]
-        )
+        manifest = frozen_by_name[
+            winner["name"]
+        ]
 
     return {
         "freezeId": body["freezeId"],
@@ -901,35 +848,39 @@ def perform_select(
             else None
         ),
         "results": results,
-        "packageManifest": package_manifest
+        "packageManifest": manifest
     }
 
 
-# ============================================================
-# POST /quantize
-# ============================================================
+# =========================================================
+# ENDPOINT
+# =========================================================
 
-@app.post(
-    "/quantize",
-    response_class=JSONResponse
-)
-async def quantize(body: QuantizeRequest):
+@app.post("/quantize")
+async def quantize(
+    request: Request,
+    body: Any = Body(...)
+):
 
-    data = body.model_dump(
-        exclude_none=False
-    )
+    # Do NOT let FastAPI/Pydantic silently reject
+    # unusual grader inputs.
+    if not isinstance(body, dict):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "INVALID_INPUT"
+            }
+        )
 
-    phase = data.get(
-        "phase"
-    )
+    phase = body.get("phase")
 
-    # ========================================================
+    # =====================================================
     # FREEZE
-    # ========================================================
+    # =====================================================
 
     if phase == "freeze":
 
-        if not validate_freeze(data):
+        if not valid_freeze(body):
 
             return JSONResponse(
                 status_code=400,
@@ -938,9 +889,7 @@ async def quantize(body: QuantizeRequest):
                 }
             )
 
-        freeze_id = data[
-            "freezeId"
-        ]
+        freeze_id = body["freezeId"]
 
         with LOCK:
 
@@ -948,17 +897,18 @@ async def quantize(body: QuantizeRequest):
                 freeze_id
             )
 
-            if existing is not None:
+            if existing:
 
-                if existing["input"] == data:
+                if equal_json(
+                    existing["input"],
+                    body
+                ):
 
                     return JSONResponse(
                         status_code=200,
-                        content=deep_copy(
-                            existing[
-                                "response"
-                            ]
-                        )
+                        content=existing[
+                            "response"
+                        ]
                     )
 
                 return JSONResponse(
@@ -969,14 +919,22 @@ async def quantize(body: QuantizeRequest):
                     }
                 )
 
-            response = perform_freeze(
-                data
+            response = do_freeze(
+                body
             )
 
             FREEZES[freeze_id] = {
-                "input": deep_copy(data),
-                "response": deep_copy(
-                    response
+                "input": json.loads(
+                    json.dumps(
+                        body,
+                        ensure_ascii=False
+                    )
+                ),
+                "response": json.loads(
+                    json.dumps(
+                        response,
+                        ensure_ascii=False
+                    )
                 )
             }
 
@@ -985,28 +943,26 @@ async def quantize(body: QuantizeRequest):
             content=response
         )
 
-    # ========================================================
+    # =====================================================
     # SELECT
-    # ========================================================
+    # =====================================================
 
     if phase == "select":
 
-        # Required top-level structure
         if (
-            not isinstance(
-                data.get("freezeId"),
-                str
+            not nonempty_string(
+                body.get("freezeId")
             )
             or not isinstance(
-                data.get("candidates"),
+                body.get("candidates"),
                 list
             )
             or not isinstance(
-                data.get("rows"),
+                body.get("rows"),
                 list
             )
             or not isinstance(
-                data.get("policy"),
+                body.get("policy"),
                 dict
             )
         ):
@@ -1018,7 +974,7 @@ async def quantize(body: QuantizeRequest):
                 }
             )
 
-        freeze_id = data[
+        freeze_id = body[
             "freezeId"
         ]
 
@@ -1029,60 +985,18 @@ async def quantize(body: QuantizeRequest):
 
         if stored is None:
 
-            # Selection response with NOT_FROZEN
-            results = []
-
-            for candidate in data[
-                "candidates"
-            ]:
-
-                if not isinstance(
-                    candidate,
-                    dict
-                ):
-                    continue
-
-                name = candidate.get(
-                    "name"
-                )
-
-                if not isinstance(
-                    name,
-                    str
-                ):
-                    continue
-
-                results.append({
-                    "name": name,
-                    "aggregate": None,
-                    "slices": {},
-                    "totalBytes": None,
-                    "latencyMs": None,
-                    "admitted": False,
-                    "reasonCodes": [
-                        "NOT_FROZEN"
-                    ]
-                })
-
-            results.sort(
-                key=lambda r:
-                utf8_sort_key(
-                    r["name"]
-                )
-            )
-
             return JSONResponse(
                 status_code=200,
                 content={
                     "freezeId": freeze_id,
                     "selected": None,
-                    "results": results,
+                    "results": [],
                     "packageManifest": None
                 }
             )
 
-        response = perform_select(
-            data,
+        response = do_select(
+            body,
             stored["response"]
         )
 
@@ -1091,7 +1005,10 @@ async def quantize(body: QuantizeRequest):
             content=response
         )
 
-    # Missing/unknown phase
+    # =====================================================
+    # UNKNOWN PHASE
+    # =====================================================
+
     return JSONResponse(
         status_code=400,
         content={
