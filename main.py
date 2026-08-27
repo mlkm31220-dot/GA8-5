@@ -296,14 +296,32 @@ def handle_select(body: Dict[str, Any]) -> JSONResponse:
         if not policy_ok or not same_set:
             codes.add("INVALID_POLICY")
 
+        # Recompute totalBytes / packageDigest from the candidate's own
+        # `inventory` (as returned by the freeze phase) -- never trust a
+        # submitted totalBytes, and never look for `files` here since the
+        # select payload carries the frozen response shape, not raw files.
         total_bytes = None
-        if is_plain_object(cand) and candidate_files_valid(cand):
-            inv = compute_inventory(cand["files"])
-            total_bytes = sum(i["bytes"] for i in inv)
-            digest = package_digest_of(inv)
-            manifest_ok = (not cand.get("packageDigest")) or cand.get("packageDigest") == digest
-            if not manifest_ok:
+        inventory = cand.get("inventory") if is_plain_object(cand) else None
+        if isinstance(inventory, list):
+            items_ok = all(
+                is_plain_object(i)
+                and is_nonempty_str(i.get("name"))
+                and is_safe_nonneg_int(i.get("bytes"))
+                and is_nonempty_str(i.get("sha256"))
+                for i in inventory
+            )
+            if not items_ok:
                 codes.add("INVALID_MANIFEST")
+            elif len(inventory) == 0:
+                # unsupported/invalid candidates: null totalBytes/packageDigest expected
+                total_bytes = None
+                if cand.get("totalBytes") is not None or cand.get("packageDigest") is not None:
+                    codes.add("INVALID_MANIFEST")
+            else:
+                total_bytes = sum(i["bytes"] for i in inventory)
+                digest = package_digest_of(inventory)
+                if cand.get("packageDigest") != digest:
+                    codes.add("INVALID_MANIFEST")
         else:
             codes.add("INVALID_MANIFEST")
 
